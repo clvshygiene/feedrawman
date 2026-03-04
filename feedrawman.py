@@ -22,12 +22,8 @@ ADMIN_PASSWORD = "admin"
 @st.cache_resource
 def get_gcp_credentials():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    try:
-        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-        return creds
-    except Exception as e:
-        st.error(f"無法讀取 Secrets 金鑰。錯誤: {e}")
-        st.stop()
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+    return creds
 
 def get_gsheet_client():
     return gspread.authorize(get_gcp_credentials())
@@ -35,73 +31,79 @@ def get_gsheet_client():
 def get_gdrive_service():
     return build('drive', 'v3', credentials=get_gcp_credentials())
 
-# 讀取 Google Sheet 資料
-try:
+# 🏆 新增：快取資料功能，ttl=300 代表 5 分鐘內不重複抓取
+@st.cache_data(ttl=300)
+def fetch_data(url):
     gc = get_gsheet_client()
-    doc = gc.open_by_url(SHEET_URL)
-    sheet_main = doc.worksheet("工作表1")
-    sheet_log = doc.worksheet("領取日誌")
-    data = pd.DataFrame(sheet_main.get_all_records())
+    doc = gc.open_by_url(url)
+    sheet = doc.worksheet("工作表1")
+    return pd.DataFrame(sheet.get_all_records())
+
+# 讀取資料
+try:
+    data = fetch_data(SHEET_URL)
 except Exception as e:
-    st.error(f"❌ Google Sheets 連線失敗：{e}")
+    st.error(f"❌ 資料讀取失敗 (可能 API 點數用完，請稍候 1 分鐘再試)：{e}")
     st.stop()
 
 # --- 4. 管理員功能 ---
 with st.sidebar:
     st.header("⚙️ 管理員選單")
+    if st.button("🔄 強制重新整理名單"):
+        st.cache_data.clear() # 清除快取，下次執行會重新抓資料
+        st.rerun()
+        
     admin_input = st.text_input("管理密碼", type="password")
     if admin_input == ADMIN_PASSWORD:
         if st.button("📢 重置所有學生領取狀態"):
+            gc = get_gsheet_client()
+            sheet_main = gc.open_by_url(SHEET_URL).worksheet("工作表1")
             num_rows = len(data) + 1 
             cell_list = sheet_main.range(f'B2:B{num_rows}')
             for cell in cell_list: cell.value = ''
             sheet_main.update_cells(cell_list)
+            st.cache_data.clear() # 重置後必清快取
             st.success("已重置狀態！")
             st.rerun()
 
 # --- 5. 領取操作介面 ---
 st.write("---")
-st.subheader("🔍 領取登記登記")
+st.subheader("🔍 領取登記")
 
-# 步驟 1：輸入學號
-student_id = st.text_input("👉 請輸入或掃描學生證學號：", key="id_input")
+student_id = st.text_input("👉 請輸入或掃描學生證學號：")
 
 if student_id:
-    # 檢查學號
     student_info = data[data['學號'].astype(str) == str(student_id)]
     
     if student_info.empty:
         st.error(f"❌ 查無學號 {student_id}")
     elif str(student_info.iloc[0].get('本次領取狀態', '')) == "已領取":
-        st.warning(f"⚠️ 學號 {student_id} 已經領取過了。")
+        st.warning(f"⚠️ 學號 {student_id} 已經領取過囉！")
     else:
-        st.success(f"✅ 符合資格！請在下方簽名。")
+        st.success(f"✅ 符合資格！請簽名。")
         
-        # 步驟 2：簽名板 (移除 st.form，確保穩定)
-        st.write("✍️ **學生簽名確認：**")
         canvas_result = st_canvas(
             fill_color="rgba(255, 255, 255, 0)",
             stroke_width=3,
             stroke_color="#000000",
             background_color="#eeeeee",
             height=150,
-            drawing_mode="freedraw", # 明確設定繪圖模式
-            key="canvas_main",
+            drawing_mode="freedraw",
+            key="canvas_v3",
         )
 
-        # 步驟 3：送出按鈕
         if st.button("🚀 確認領取並存檔"):
             if canvas_result.image_data is not None:
                 try:
                     with st.spinner('正在存檔中...'):
-                        # 處理圖片
+                        # A. 處理圖片
                         img_data = canvas_result.image_data
                         img = Image.fromarray((img_data).astype('uint8'), mode='RGBA')
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='PNG')
                         img_byte_arr.seek(0)
 
-                        # 上傳 Drive
+                        # B. 上傳 Drive
                         now = datetime.datetime.now()
                         file_name = f"簽名_{student_id}_{now.strftime('%Y%m%d_%H%M%S')}.png"
                         drive_service = get_gdrive_service()
@@ -112,15 +114,22 @@ if student_id:
                         ).execute()
                         img_url = file.get('webViewLink')
 
-                        # 更新 Sheet
+                        # C. 更新 Sheet (這裡不使用快取，直接寫入)
+                        gc = get_gsheet_client()
+                        doc = gc.open_by_url(SHEET_URL)
+                        sheet_main = doc.worksheet("工作表1")
+                        sheet_log = doc.worksheet("領取日誌")
+                        
                         row_idx = int(student_info.index[0]) + 2
                         sheet_main.update_cell(row_idx, 2, "已領取")
                         sheet_log.append_row([str(student_id), now.strftime("%Y-%m-%d %H:%M:%S"), img_url])
+                        
+                        # D. 存檔後清除快取，確保下一位搜尋時資料是最新的
+                        st.cache_data.clear()
 
                     st.balloons()
-                    st.success(f"🎉 登記成功！請發放用品。")
-                    st.info(f"簽名檔：[點此查看]({img_url})")
+                    st.success(f"🎉 登記成功！學號 {student_id} 已完成領取。")
                 except Exception as e:
-                    st.error(f"💔 發生錯誤：{e}")
+                    st.error(f"💔 存檔失敗：{e}")
             else:
-                st.warning("請先簽名再點擊送出。")
+                st.warning("請先簽名再送出。")
