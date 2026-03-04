@@ -1,5 +1,7 @@
 streamlit
+pandas
 gspread
 google-auth
-pandas
+google-api-python-client
 streamlit-drawable-canvas
+Pillow
