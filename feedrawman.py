@@ -114,7 +114,6 @@ if student_id:
                             media_body=media, 
                             fields='id, webViewLink', 
                             supportsAllDrives=True,   # 👈 必備：支援共用硬碟
-                            includeItemsFromAllDrives=True  # 👈 加上這行會更保險
                         ).execute()
                         img_url = file.get('webViewLink')
 
@@ -137,4 +136,5 @@ if student_id:
                     st.error(f"💔 存檔失敗：{e}")
             else:
                 st.warning("請先簽名再送出。")
+
 
