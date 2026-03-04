@@ -110,7 +110,11 @@ if student_id:
                         file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
                         media = MediaIoBaseUpload(img_byte_arr, mimetype='image/png', resumable=True)
                         file = drive_service.files().create(
-                            body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True 
+                            body=file_metadata, 
+                            media_body=media, 
+                            fields='id, webViewLink', 
+                            supportsAllDrives=True,   # 👈 必備：支援共用硬碟
+                            includeItemsFromAllDrives=True  # 👈 加上這行會更保險
                         ).execute()
                         img_url = file.get('webViewLink')
 
@@ -133,3 +137,4 @@ if student_id:
                     st.error(f"💔 存檔失敗：{e}")
             else:
                 st.warning("請先簽名再送出。")
+
