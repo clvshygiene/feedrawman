@@ -7,6 +7,7 @@ from googleapiclient.http import MediaIoBaseUpload
 from streamlit_drawable_canvas import st_canvas
 import datetime
 import io
+import base64
 from PIL import Image
 
 # --- 1. 系統設定 ---
@@ -92,49 +93,41 @@ if student_id:
             key="canvas_v3",
         )
 
-        if st.button("🚀 確認領取並存檔"):
+if st.button("🚀 確認領取並存檔"):
             if canvas_result.image_data is not None:
                 try:
                     with st.spinner('正在存檔中...'):
-                        # A. 處理圖片
+                        # 1. 處理圖片，將其轉為 Base64 文字格式
                         img_data = canvas_result.image_data
                         img = Image.fromarray((img_data).astype('uint8'), mode='RGBA')
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='PNG')
-                        img_byte_arr.seek(0)
+                        
+                        # 將圖片二進位轉成超長字串
+                        base64_encoded = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+                        img_data_url = f"data:image/png;base64,{base64_encoded}"
 
-                        # B. 上傳 Drive
-                        now = datetime.datetime.now()
-                        file_name = f"簽名_{student_id}_{now.strftime('%Y%m%d_%H%M%S')}.png"
-                        drive_service = get_gdrive_service()
-                        file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
-                        media = MediaIoBaseUpload(img_byte_arr, mimetype='image/png', resumable=True)
-                        file = drive_service.files().create(
-                            body=file_metadata, 
-                            media_body=media, 
-                            fields='id, webViewLink', 
-                            supportsAllDrives=True,   # 👈 必備：支援共用硬碟
-                        ).execute()
-                        img_url = file.get('webViewLink')
-
-                        # C. 更新 Sheet (這裡不使用快取，直接寫入)
+                        # 2. 更新 Google Sheet 狀態
                         gc = get_gsheet_client()
                         doc = gc.open_by_url(SHEET_URL)
                         sheet_main = doc.worksheet("工作表1")
                         sheet_log = doc.worksheet("領取日誌")
                         
+                        # 標記已領取
                         row_idx = int(student_info.index[0]) + 2
                         sheet_main.update_cell(row_idx, 2, "已領取")
-                        sheet_log.append_row([str(student_id), now.strftime("%Y-%m-%d %H:%M:%S"), img_url])
-                        
-                        # D. 存檔後清除快取，確保下一位搜尋時資料是最新的
-                        st.cache_data.clear()
 
+                        # 3. 寫入領取日誌 (將簽名的長字串存入 C 欄)
+                        now = datetime.datetime.now()
+                        sheet_log.append_row([str(student_id), now.strftime("%Y-%m-%d %H:%M:%S"), img_data_url])
+
+                    st.cache_data.clear() # 清除快取，讓下一個人看到最新狀態
                     st.balloons()
                     st.success(f"🎉 登記成功！學號 {student_id} 已完成領取。")
+                    st.info("✅ 簽名已安全轉換並存入試算表日誌中！")
+
                 except Exception as e:
                     st.error(f"💔 存檔失敗：{e}")
             else:
-                st.warning("請先簽名再送出。")
-
+                st.warning("請先簽名再點擊送出。")
 
