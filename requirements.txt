@@ -5,3 +5,5 @@ google-auth
 google-api-python-client
 streamlit-drawable-canvas
 Pillow
+streamlit-qrcode-scanner
+reportlab
