@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -8,9 +9,6 @@ from streamlit_drawable_canvas import st_canvas
 import datetime
 import io
 from PIL import Image
-
-# ✅ 條碼掃描元件（會回傳字串）
-from streamlit_barcode_scanner import qr_scanner
 
 # PDF
 from reportlab.lib.pagesizes import A4
@@ -104,7 +102,158 @@ def make_receipt_pdf(student_id: str, ts_str: str, signature_png_bytes: bytes) -
     return buf.getvalue()
 
 # ----------------------------
-# 4) 讀取名單
+# 4) 手機相機掃一維條碼（QuaggaJS）
+#    掃到後：把結果寫進 URL ?sid=xxxx，觸發整頁 rerun
+# ----------------------------
+def barcode_scanner_quagga(height: int = 420):
+    html = """
+    <div class="w-full h-full">
+      <script src="https://cdn.tailwindcss.com"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.min.js"></script>
+
+      <div class="p-3 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="text-sm text-slate-600">對準條碼，亮一點、距離 10–18cm。掃到會自動停止並回填學號。</div>
+          <div class="text-xs text-slate-500" id="status">未啟動</div>
+        </div>
+
+        <div class="flex gap-2">
+          <button id="startBtn"
+            class="px-3 py-2 rounded-xl bg-slate-900 text-white text-sm active:scale-[0.99]">
+            開始掃描
+          </button>
+          <button id="stopBtn"
+            class="px-3 py-2 rounded-xl bg-slate-200 text-slate-900 text-sm active:scale-[0.99]">
+            停止
+          </button>
+          <button id="torchBtn"
+            class="px-3 py-2 rounded-xl bg-slate-200 text-slate-900 text-sm active:scale-[0.99]">
+            手電筒
+          </button>
+        </div>
+
+        <div class="rounded-2xl overflow-hidden border border-slate-200 bg-black">
+          <div id="scanner" style="width: 100%; height: 280px;"></div>
+        </div>
+
+        <div class="rounded-2xl border border-slate-200 bg-white p-3">
+          <div class="text-xs text-slate-500">掃描結果</div>
+          <div class="text-lg font-semibold" id="result">—</div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const resultEl = document.getElementById("result");
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      const torchBtn = document.getElementById("torchBtn");
+
+      let lastCode = "";
+      let scanning = false;
+      let track = null;
+      let torchOn = false;
+
+      function setStatus(t) { statusEl.textContent = t; }
+
+      function sendToStreamlit(value) {
+        // ✅ 將掃描結果寫入父頁 URL query param：?sid=xxxx
+        const url = new URL(window.parent.location.href);
+        url.searchParams.set("sid", value);
+        window.parent.location.href = url.toString();
+      }
+
+      async function tryEnableTorch() {
+        try {
+          if (!track) return;
+          const caps = track.getCapabilities ? track.getCapabilities() : null;
+          if (!caps || !caps.torch) {
+            alert("此裝置/瀏覽器不支援手電筒");
+            return;
+          }
+          torchOn = !torchOn;
+          await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+        } catch (e) {
+          console.log(e);
+          alert("手電筒啟用失敗（可能不支援）");
+        }
+      }
+
+      function start() {
+        if (scanning) return;
+        setStatus("啟動中…");
+
+        Quagga.init({
+          inputStream: {
+            name: "Live",
+            type: "LiveStream",
+            target: document.querySelector('#scanner'),
+            constraints: {
+              facingMode: "environment",
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          },
+          decoder: {
+            readers: [
+              "code_128_reader",
+              "code_39_reader",
+              "ean_reader",
+              "ean_8_reader",
+              "upc_reader"
+            ]
+          },
+          locate: true,
+          numOfWorkers: 0
+        }, function(err) {
+          if (err) {
+            console.log(err);
+            setStatus("啟動失敗");
+            alert("相機啟動失敗：請確認瀏覽器相機權限已允許");
+            return;
+          }
+          Quagga.start();
+          scanning = true;
+          setStatus("掃描中");
+
+          setTimeout(() => {
+            const video = document.querySelector("#scanner video");
+            if (video && video.srcObject) {
+              const tracks = video.srcObject.getVideoTracks();
+              if (tracks && tracks.length) track = tracks[0];
+            }
+          }, 800);
+        });
+
+        Quagga.onDetected(function(data) {
+          const code = (data && data.codeResult && data.codeResult.code) ? data.codeResult.code : "";
+          if (!code) return;
+          if (code === lastCode) return;
+          lastCode = code;
+
+          resultEl.textContent = code;
+          stop();
+          sendToStreamlit(code);
+        });
+      }
+
+      function stop() {
+        if (!scanning) return;
+        try { Quagga.stop(); } catch (e) {}
+        scanning = false;
+        setStatus("已停止");
+      }
+
+      startBtn.addEventListener("click", start);
+      stopBtn.addEventListener("click", stop);
+      torchBtn.addEventListener("click", tryEnableTorch);
+    </script>
+    """
+    return components.html(html, height=height)
+
+# ----------------------------
+# 5) 讀取名單
 # ----------------------------
 try:
     data = fetch_data(SHEET_URL)
@@ -113,7 +262,7 @@ except Exception as e:
     st.stop()
 
 # ----------------------------
-# 5) UI 美化 + 狀態
+# 6) UI 美化 + 狀態
 # ----------------------------
 st.markdown("""
 <style>
@@ -137,30 +286,44 @@ st.write("---")
 st.subheader("🔍 領取登記")
 
 # ----------------------------
-# 6) 掃描區（手機條碼）
+# 7) 從 URL 讀 sid 自動回填（掃描成功會帶 ?sid=xxxx）
 # ----------------------------
-st.markdown('<div class="hint">學生證是「一維條碼」。開啟掃描後，允許相機權限，對準條碼即可。</div>', unsafe_allow_html=True)
+try:
+    sid = st.query_params.get("sid", None)
+except Exception:
+    sid = None
 
+if sid:
+    # 有些版本會是 list
+    if isinstance(sid, list) and sid:
+        sid = sid[0]
+    sid = str(sid).strip()
+    sid_digits = "".join(ch for ch in sid if ch.isdigit())
+    if sid_digits:
+        st.session_state.student_id_input = sid_digits
+    # 清掉 query params，避免重整又重覆套用
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+# ----------------------------
+# 8) 掃描 UI
+# ----------------------------
+st.markdown('<div class="hint">學生證是「一維條碼」。開啟掃描後，允許相機權限，對準條碼即可（掃到會自動回填學號）。</div>', unsafe_allow_html=True)
 enable_scan = st.toggle("📷 用手機相機掃學生證條碼", value=False)
 
 if enable_scan:
-    scanned = qr_scanner(key="scan1")  # ✅ 回傳掃到的內容（掃到才會有值）
-    if scanned:
-        # 保險：只留數字（學生證通常就是學號）
-        scanned = "".join(ch for ch in str(scanned) if ch.isdigit())
-        if scanned:
-            st.session_state.student_id_input = scanned
-            st.success(f"已掃描：{scanned}")
+    barcode_scanner_quagga()
 
 student_id = st.text_input(
     "👉 請輸入或掃描學生證學號：",
     value=st.session_state.student_id_input
 ).strip()
-
 st.session_state.student_id_input = student_id
 
 # ----------------------------
-# 7) 驗證學號
+# 9) 驗證學號
 # ----------------------------
 if student_id:
     if "學號" not in data.columns:
@@ -184,7 +347,7 @@ if student_id:
             st.success("✅ 符合資格！請簽名。")
 
 # ----------------------------
-# 8) 簽名板 + 存檔（PNG + PDF）
+# 10) 簽名板 + 存檔（PNG + PDF）
 # ----------------------------
 if st.session_state.eligible and st.session_state.verified_student_id == str(student_id) and student_id:
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
