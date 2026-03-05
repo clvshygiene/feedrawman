@@ -7,4 +7,3 @@ streamlit-drawable-canvas
 Pillow
 streamlit-qrcode-scanner
 reportlab
-git+https://github.com/FloWide/streamlit-barcode-scanner.git
