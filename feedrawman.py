@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -8,13 +7,11 @@ from googleapiclient.http import MediaIoBaseUpload
 from streamlit_drawable_canvas import st_canvas
 import datetime
 import io
-import re
+import time
+from zoneinfo import ZoneInfo
 from PIL import Image
 
-# 台灣時間
-from zoneinfo import ZoneInfo
-
-# 寄信
+# Email
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -24,9 +21,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
 
-
 # ----------------------------
-# 0) 常數
+# 基本設定
 # ----------------------------
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
@@ -36,13 +32,11 @@ st.title("🌸 校園生理用品領取系統")
 SHEET_URL = "https://docs.google.com/spreadsheets/d/13bMCf_cgdfByYH_DgUZynKHKZAHd2qmXJKyeCfCQOg8/edit"
 DRIVE_FOLDER_ID = "1WPfK0coynKAwb15EfVp0st5VEGjNmUAl"
 
-# 你校內學號長度（請依你學校調整）
-STUDENT_ID_MIN_LEN = 6
-STUDENT_ID_MAX_LEN = 10
-
+STUDENT_EMAIL_DOMAIN = "@g.clvs.tyc.edu.tw"
+PICKED_TEXT = "已領取"
 
 # ----------------------------
-# 1) Google API
+# Google API
 # ----------------------------
 @st.cache_resource
 def get_gcp_credentials():
@@ -58,16 +52,41 @@ def get_gsheet_client():
 def get_gdrive_service():
     return build("drive", "v3", credentials=get_gcp_credentials())
 
-@st.cache_data(ttl=300)
-def fetch_data(url):
+@st.cache_data(ttl=120)
+def fetch_sheet(url, worksheet_name):
     gc = get_gsheet_client()
     doc = gc.open_by_url(url)
-    sheet = doc.worksheet("工作表1")
-    return pd.DataFrame(sheet.get_all_records())
+    ws = doc.worksheet(worksheet_name)
+    return pd.DataFrame(ws.get_all_records())
 
+def get_worksheet(url, worksheet_name):
+    gc = get_gsheet_client()
+    doc = gc.open_by_url(url)
+    return doc.worksheet(worksheet_name)
 
 # ----------------------------
-# 2) 工具：簽名、上傳、PDF
+# 小工具：偵測狀態欄位
+# ----------------------------
+def detect_status_column(df: pd.DataFrame) -> str:
+    """
+    使用者沒有提供狀態欄位時：
+    1) 優先找欄名同時包含「領取」與「狀態」
+    2) 其次找包含「領取」或「狀態」
+    3) 都找不到：用第 2 欄（通常是狀態）
+    """
+    cols = list(df.columns)
+    for c in cols:
+        if ("領取" in c) and ("狀態" in c):
+            return c
+    for c in cols:
+        if ("領取" in c) or ("狀態" in c):
+            return c
+    if len(cols) >= 2:
+        return cols[1]
+    return cols[0]
+
+# ----------------------------
+# 簽名 / 上傳 / PDF
 # ----------------------------
 def canvas_to_png_bytes(canvas_image_data) -> bytes:
     img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
@@ -79,20 +98,20 @@ def upload_bytes_to_drive(file_bytes: bytes, filename: str, mimetype: str) -> tu
     drive = get_gdrive_service()
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mimetype, resumable=False)
     metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-
     created = drive.files().create(
         body=metadata,
         media_body=media,
         fields="id,webViewLink",
         supportsAllDrives=True,
     ).execute()
-
     return created["id"], created["webViewLink"]
 
 @st.cache_resource
 def register_pdf_fonts():
-    # 你已經成功的版本：若你已放字體檔，這行就會生效
-    # 沒放字體檔也沒關係：下面 make_receipt_pdf 會 fallback
+    """
+    若你 repo 有 fonts/NotoSansTC-Black.ttf 就會用中文黑體
+    沒有也不會壞掉：會 fallback Helvetica
+    """
     try:
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
@@ -102,207 +121,54 @@ def register_pdf_fonts():
         return False
 
 def make_receipt_pdf(student_id: str, ts_str: str, signature_png_bytes: bytes) -> bytes:
-    """
-    中文簽收單（優先使用 NotoSansTC-Black；失敗則 fallback Helvetica）
-    """
     ok_font = register_pdf_fonts()
-    font_name = "NotoSansTC-Black" if ok_font else "Helvetica-Bold"
+    title_font = "NotoSansTC-Black" if ok_font else "Helvetica-Bold"
+    text_font = "NotoSansTC-Black" if ok_font else "Helvetica"
 
     buf = io.BytesIO()
     c = pdf_canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
-    # 標題
-    c.setFont(font_name, 18)
+    c.setFont(title_font, 18)
     c.drawString(40, height - 60, "生理用品領取簽收單")
 
-    # 基本資訊
-    c.setFont(font_name, 12)
+    c.setFont(text_font, 12)
     c.drawString(40, height - 98, f"學號：{student_id}")
     c.drawString(40, height - 120, f"時間：{ts_str}")
 
-    # 簽名區
-    c.setFont(font_name, 12)
+    c.setFont(text_font, 12)
     c.drawString(40, height - 160, "簽名：")
 
     sig_img = ImageReader(io.BytesIO(signature_png_bytes))
     img_w = 420
-    img_h = 160
+    img_h = 170
     x = 40
     y = height - 160 - img_h - 10
 
     c.rect(x, y, img_w, img_h, stroke=1, fill=0)
     c.drawImage(sig_img, x, y, width=img_w, height=img_h, mask="auto")
 
-    c.setFont(font_name, 10)
+    c.setFont(text_font, 10)
     c.drawString(40, 40, "本簽收單由系統自動產生")
 
     c.showPage()
     c.save()
     return buf.getvalue()
 
-
 # ----------------------------
-# 3) 掃碼：QuaggaJS（掃到後寫入 URL ?sid=xxxx）
-# ----------------------------
-def barcode_scanner_quagga(height: int = 420):
-    html = """
-    <div class="w-full h-full">
-      <script src="https://cdn.tailwindcss.com"></script>
-      <script src="https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.min.js"></script>
-
-      <div class="p-3 space-y-3">
-        <div class="flex items-center justify-between">
-          <div class="text-sm text-slate-600">對準條碼（亮一點、距離 10–18cm）。掃到會自動回填。</div>
-          <div class="text-xs text-slate-500" id="status">未啟動</div>
-        </div>
-
-        <div class="flex gap-2">
-          <button id="startBtn"
-            class="px-3 py-2 rounded-xl bg-slate-900 text-white text-sm active:scale-[0.99]">
-            開始掃描
-          </button>
-          <button id="stopBtn"
-            class="px-3 py-2 rounded-xl bg-slate-200 text-slate-900 text-sm active:scale-[0.99]">
-            停止
-          </button>
-        </div>
-
-        <div class="rounded-2xl overflow-hidden border border-slate-200 bg-black">
-          <div id="scanner" style="width: 100%; height: 280px;"></div>
-        </div>
-
-        <div class="rounded-2xl border border-slate-200 bg-white p-3">
-          <div class="text-xs text-slate-500">掃描結果</div>
-          <div class="text-lg font-semibold" id="result">—</div>
-        </div>
-      </div>
-    </div>
-
-    <script>
-      const statusEl = document.getElementById("status");
-      const resultEl = document.getElementById("result");
-      const startBtn = document.getElementById("startBtn");
-      const stopBtn = document.getElementById("stopBtn");
-
-      let lastCode = "";
-      let scanning = false;
-
-      function setStatus(t) { statusEl.textContent = t; }
-
-      function sendToStreamlit(value) {
-        // 將掃描結果寫入父頁 URL query param：?sid=xxxx
-        const url = new URL(window.parent.location.href);
-        url.searchParams.set("sid", value);
-        // 加一個 cache-bust，避免某些瀏覽器不重載
-        url.searchParams.set("_t", Date.now().toString());
-        window.parent.location.href = url.toString();
-      }
-
-      function start() {
-        if (scanning) return;
-        setStatus("啟動中…");
-
-        Quagga.init({
-          inputStream: {
-            name: "Live",
-            type: "LiveStream",
-            target: document.querySelector('#scanner'),
-            constraints: {
-              facingMode: "environment",
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-            },
-          },
-          decoder: {
-            readers: [
-              "code_128_reader",
-              "code_39_reader",
-              "ean_reader",
-              "ean_8_reader",
-              "upc_reader"
-            ]
-          },
-          locate: true,
-          numOfWorkers: 0
-        }, function(err) {
-          if (err) {
-            console.log(err);
-            setStatus("啟動失敗");
-            alert("相機啟動失敗：請確認瀏覽器相機權限已允許");
-            return;
-          }
-          Quagga.start();
-          scanning = true;
-          setStatus("掃描中");
-        });
-
-        Quagga.onDetected(function(data) {
-          const code = (data && data.codeResult && data.codeResult.code) ? data.codeResult.code : "";
-          if (!code) return;
-          if (code === lastCode) return;
-          lastCode = code;
-
-          resultEl.textContent = code;
-          stop();
-          sendToStreamlit(code);
-        });
-      }
-
-      function stop() {
-        if (!scanning) return;
-        try { Quagga.stop(); } catch (e) {}
-        scanning = false;
-        setStatus("已停止");
-      }
-
-      startBtn.addEventListener("click", start);
-      stopBtn.addEventListener("click", stop);
-    </script>
-    """
-    return components.html(html, height=height)
-
-
-# ----------------------------
-# 4) 把掃描字串轉成「學號」
-# ----------------------------
-def parse_student_id(raw: str) -> tuple[str | None, str]:
-    """
-    回傳 (student_id_or_none, debug_message)
-    規則：抓最像學號的一段連續數字（長度 6~10 可調）
-    """
-    if raw is None:
-        return None, "raw=None"
-
-    s = str(raw).strip()
-    # 有些情況 query_params 可能給 list
-    if isinstance(raw, list) and raw:
-        s = str(raw[0]).strip()
-
-    # 抓出所有連續數字片段
-    nums = re.findall(r"\d+", s)
-    if not nums:
-        return None, f"raw='{s}' 找不到任何數字片段"
-
-    # 優先選「長度符合學號範圍」的片段，且取最長/最像的
-    candidates = [x for x in nums if STUDENT_ID_MIN_LEN <= len(x) <= STUDENT_ID_MAX_LEN]
-    if candidates:
-        # 取最長的（通常學號固定長度）
-        candidates.sort(key=len, reverse=True)
-        return candidates[0], f"raw='{s}' nums={nums} -> pick={candidates[0]}"
-
-    # 若沒有符合長度的，就退而求其次：取最長一段
-    nums.sort(key=len, reverse=True)
-    return nums[0], f"raw='{s}' nums={nums} -> fallback_pick={nums[0]}"
-
-
-# ----------------------------
-# 5) SMTP 寄信
+# SMTP 寄信
 # ----------------------------
 def send_email(to_addr: str, subject: str, body: str) -> None:
     """
-    從 st.secrets 讀 SMTP 設定：
-    st.secrets["smtp"]["host"], ["port"], ["username"], ["password"], ["from_name"], ["from_addr"], ["use_tls"]
+    需要 secrets.toml:
+    [smtp]
+    host="smtp.gmail.com"
+    port=587
+    username="你的寄件帳號"
+    password="16碼金鑰"
+    from_addr="同 username"
+    from_name="衛生組"
+    use_tls=true
     """
     cfg = st.secrets["smtp"]
     host = cfg["host"]
@@ -319,7 +185,7 @@ def send_email(to_addr: str, subject: str, body: str) -> None:
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    with smtplib.SMTP(host, port, timeout=20) as server:
+    with smtplib.SMTP(host, port, timeout=25) as server:
         server.ehlo()
         if use_tls:
             server.starttls()
@@ -328,29 +194,81 @@ def send_email(to_addr: str, subject: str, body: str) -> None:
             server.login(username, password)
         server.send_message(msg)
 
+# ----------------------------
+# 可選：庫存（若沒有「庫存」工作表就跳過）
+# ----------------------------
+def try_load_inventory():
+    try:
+        inv = fetch_sheet(SHEET_URL, "庫存")
+        if inv.empty:
+            return None, None
+        # 預期欄位：品項 / 庫存 / 安全庫存 (可自行改)
+        return inv, "庫存"
+    except Exception:
+        return None, None
+
+def try_update_inventory(delta: int = -1) -> tuple[bool, str]:
+    """
+    預設：每成功領取扣 1
+    工作表「庫存」第 1 列第一筆品項當作總庫存
+    欄位：庫存、(可選)安全庫存
+    """
+    try:
+        ws = get_worksheet(SHEET_URL, "庫存")
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty:
+            return False, "庫存表是空的"
+
+        # 偵測庫存欄位
+        stock_col = None
+        for c in df.columns:
+            if "庫存" in c:
+                stock_col = c
+                break
+        if not stock_col:
+            return False, "庫存表找不到「庫存」欄位"
+
+        cur = df.iloc[0].get(stock_col, 0)
+        try:
+            cur = int(cur)
+        except Exception:
+            return False, f"庫存欄位不是數字：{cur}"
+
+        new_val = cur + delta
+        if new_val < 0:
+            return False, "庫存不足，無法扣帳"
+
+        # 更新到試算表：第一筆資料的庫存欄位
+        # ws.get_all_records() 會從第 2 列開始，所以 df.iloc[0] 對應到 sheet row=2
+        row = 2
+        col = list(df.columns).index(stock_col) + 1
+        ws.update_cell(row, col, new_val)
+        return True, f"庫存 {cur} → {new_val}"
+    except Exception as e:
+        return False, f"庫存更新失敗：{e}"
 
 # ----------------------------
-# 6) 讀取名單
+# 讀取主表
 # ----------------------------
 try:
-    data = fetch_data(SHEET_URL)
+    main_df = fetch_sheet(SHEET_URL, "工作表1")
 except Exception as e:
     st.error(f"❌ 資料讀取失敗：{e}")
     st.stop()
 
+if main_df.empty:
+    st.error("❌ 工作表1 沒有資料")
+    st.stop()
+
+if "學號" not in main_df.columns:
+    st.error("❌ 工作表1 缺少「學號」欄位")
+    st.stop()
+
+STATUS_COL = detect_status_column(main_df)
 
 # ----------------------------
-# 7) UI 美化 + session_state
+# Session state
 # ----------------------------
-st.markdown("""
-<style>
-.toolbar {border:1px solid rgba(0,0,0,.08); border-radius:16px; padding:12px; background:white;}
-.canvas-wrap {border-radius:16px; overflow:hidden; border:1px solid rgba(0,0,0,.10);}
-.small-label {font-size:12px; color:rgba(0,0,0,.6); margin-bottom:4px;}
-.hint {font-size:13px; color:rgba(0,0,0,.65); margin-bottom:8px;}
-</style>
-""", unsafe_allow_html=True)
-
 if "verified_student_id" not in st.session_state:
     st.session_state.verified_student_id = None
 if "eligible" not in st.session_state:
@@ -359,160 +277,264 @@ if "canvas_nonce" not in st.session_state:
     st.session_state.canvas_nonce = 0
 if "student_id_input" not in st.session_state:
     st.session_state.student_id_input = ""
-if "scan_debug" not in st.session_state:
-    st.session_state.scan_debug = ""
-
+if "sig_landscape" not in st.session_state:
+    st.session_state.sig_landscape = True  # 預設大簽名
+if "sig_height" not in st.session_state:
+    st.session_state.sig_height = 420
 
 # ----------------------------
-# 8) 管理功能：寄提醒信（在 sidebar）
+# Sidebar：功能選單
 # ----------------------------
 with st.sidebar:
-    st.header("✉️ 提醒信寄送")
+    st.header("⚙️ 管理功能")
 
-    # 你可以自行加管理密碼（避免學生亂寄）
+    # 快速看狀態欄位偵測結果
+    st.caption(f"狀態欄位：{STATUS_COL}")
+
+    # 庫存區（可選）
+    inv_df, _ = try_load_inventory()
+    if inv_df is None:
+        st.info("（可選）要啟用庫存：請在試算表新增工作表「庫存」\n建議欄位：品項、庫存、安全庫存")
+    else:
+        # 顯示第一筆庫存
+        stock_col = None
+        safety_col = None
+        for c in inv_df.columns:
+            if "安全" in c:
+                safety_col = c
+            if c == "庫存" or ("庫存" in c):
+                stock_col = stock_col or c
+
+        if stock_col:
+            cur_stock = inv_df.iloc[0].get(stock_col, "")
+            st.metric("目前庫存", cur_stock)
+            if safety_col:
+                safety = inv_df.iloc[0].get(safety_col, "")
+                st.caption(f"安全庫存：{safety}")
+        else:
+            st.warning("庫存表找不到「庫存」欄位")
+
+    st.divider()
+
+    # 寄信區
+    st.header("✉️ 未領取自動寄信")
+
+    # 管理密碼（可選）
     admin_ok = True
-    if "admin" in st.secrets:
+    if "admin" in st.secrets and "password" in st.secrets["admin"]:
         pwd = st.text_input("管理密碼", type="password")
-        admin_ok = (pwd == st.secrets["admin"].get("password", ""))
+        admin_ok = (pwd == st.secrets["admin"]["password"])
 
     if not admin_ok:
         st.warning("需要管理密碼才能寄信")
     else:
-        st.caption("收件人規則：學號 + @g.clvs.tyc.edu.tw")
-
-        # 你可以貼一個或多個學號（每行一個）
-        ids_text = st.text_area(
-            "要寄信的學號（可多筆，每行一個）",
-            placeholder="例如：\n311117\n311118",
-            height=120,
-        )
+        mode = st.selectbox("寄送模式", ["寄給所有未領取", "寄給指定學號"])
 
         subject = st.text_input("主旨", value="生理用品領取提醒")
         body = st.text_area(
-            "內容（可用 {student_id} 代入學號）",
+            "內容（可用 {student_id}）",
             value="同學您好：\n\n提醒您可至衛生組領取生理用品。\n學號：{student_id}\n\n謝謝。",
-            height=180,
+            height=170,
         )
+        throttle = st.slider("每封間隔(秒)（避免被鎖）", 0.3, 2.0, 0.8, 0.1)
+        max_send = st.number_input("本次最多寄送封數", min_value=1, max_value=500, value=80)
 
-        if st.button("📨 寄出提醒信", use_container_width=True):
-            ids = [x.strip() for x in ids_text.splitlines() if x.strip()]
-            if not ids:
-                st.error("請至少輸入 1 個學號")
+        ids_to_send = []
+        if mode == "寄給指定學號":
+            ids_text = st.text_area("學號（每行一個）", height=120)
+            ids_to_send = [x.strip() for x in ids_text.splitlines() if x.strip()]
+        else:
+            # 所有未領取
+            tmp = main_df.copy()
+            tmp_status = tmp[STATUS_COL].astype(str).str.strip()
+            not_picked = tmp[tmp_status != PICKED_TEXT]
+            ids_to_send = not_picked["學號"].astype(str).tolist()
+
+        if st.button("📨 開始寄送", use_container_width=True):
+            if "smtp" not in st.secrets:
+                st.error("secrets.toml 缺少 [smtp] 設定")
+            elif not ids_to_send:
+                st.error("沒有找到收件人")
             else:
+                ids_to_send = list(dict.fromkeys(ids_to_send))  # 去重
+                ids_to_send = ids_to_send[: int(max_send)]
+
+                ok = 0
                 failed = []
-                sent = 0
-                for sid in ids:
-                    email = f"{sid}@g.clvs.tyc.edu.tw"
+
+                prog = st.progress(0)
+                for i, sid in enumerate(ids_to_send, start=1):
+                    to_addr = f"{sid}{STUDENT_EMAIL_DOMAIN}"
                     try:
                         send_email(
-                            to_addr=email,
+                            to_addr=to_addr,
                             subject=subject.format(student_id=sid),
                             body=body.format(student_id=sid),
                         )
-                        sent += 1
+                        ok += 1
                     except Exception as e:
                         failed.append((sid, str(e)))
 
-                if sent:
-                    st.success(f"已寄出 {sent} 封")
+                    prog.progress(i / len(ids_to_send))
+                    time.sleep(float(throttle))
+
+                st.success(f"✅ 已寄出 {ok} 封")
                 if failed:
-                    st.error("部分寄送失敗：")
+                    st.error(f"❌ 失敗 {len(failed)} 封（顯示前 10 筆）")
                     for sid, err in failed[:10]:
                         st.write(f"- {sid}: {err}")
 
+    st.divider()
+
+    # 儀表板切換
+    show_dashboard = st.toggle("📊 顯示統計儀表板", value=True)
 
 # ----------------------------
-# 9) 領取登記 + 掃描
+# 儀表板
 # ----------------------------
-st.write("---")
-st.subheader("🔍 領取登記")
+if "show_dashboard" not in locals():
+    show_dashboard = True
 
-# 讀 URL query params：sid（掃描結果）
-try:
-    raw_sid = st.query_params.get("sid", None)
-except Exception:
-    raw_sid = None
+if show_dashboard:
+    st.subheader("📊 領取統計儀表板")
 
-if raw_sid:
-    student_id_parsed, dbg = parse_student_id(raw_sid)
-    st.session_state.scan_debug = dbg
-    if student_id_parsed:
-        st.session_state.student_id_input = student_id_parsed
-    # 清 query params（避免一直重覆套用）
+    # 已領取/未領取
+    status_series = main_df[STATUS_COL].astype(str).str.strip()
+    picked = (status_series == PICKED_TEXT).sum()
+    total = len(main_df)
+    not_picked = total - picked
+    rate = (picked / total * 100) if total else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("總人數", total)
+    c2.metric("已領取", picked)
+    c3.metric("未領取", not_picked)
+    c4.metric("領取率", f"{rate:.1f}%")
+
+    # 從「領取日誌」拉趨勢（若沒有就跳過）
     try:
-        st.query_params.clear()
+        log_df = fetch_sheet(SHEET_URL, "領取日誌")
     except Exception:
-        pass
+        log_df = pd.DataFrame()
 
-st.markdown('<div class="hint">若掃描回填失敗，下面會顯示掃描 debug（只給你看）。</div>', unsafe_allow_html=True)
-enable_scan = st.toggle("📷 用手機相機掃學生證條碼", value=False)
-if enable_scan:
-    barcode_scanner_quagga()
+    if not log_df.empty and len(log_df.columns) >= 2:
+        # 預期第 2 欄是時間字串
+        time_col = log_df.columns[1]
+        # parse 成台灣時間日期
+        def to_date(s):
+            try:
+                dt = datetime.datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ_TAIPEI)
+                return dt.date()
+            except Exception:
+                return None
 
-# 顯示 debug（你要更乾淨可關掉）
-if st.session_state.scan_debug:
-    with st.expander("🛠️ 掃描 debug（若回填不對請看這裡）"):
-        st.code(st.session_state.scan_debug)
+        log_df["_date"] = log_df[time_col].apply(to_date)
+        daily = log_df.dropna(subset=["_date"]).groupby("_date").size().reset_index(name="count")
+        daily = daily.sort_values("_date")
 
-student_id = st.text_input(
-    "👉 請輸入或掃描學生證學號：",
-    value=st.session_state.student_id_input
-).strip()
+        # 近 7 日
+        today = datetime.datetime.now(TZ_TAIPEI).date()
+        start = today - datetime.timedelta(days=6)
+        daily_7 = daily[daily["_date"] >= start]
+
+        st.line_chart(daily_7.set_index("_date")["count"])
+
+        # 今日人次
+        today_count = int((log_df["_date"] == today).sum())
+        st.caption(f"今日領取人次：{today_count}")
+    else:
+        st.info("尚未建立「領取日誌」或格式不足，暫不顯示趨勢圖。")
+
+st.write("---")
+st.subheader("✍️ 領取登記（手動輸入學號）")
+
+# ----------------------------
+# 登記區：輸入學號 -> 顯示簽名板
+# ----------------------------
+student_id = st.text_input("👉 請輸入學生證學號：", value=st.session_state.student_id_input).strip()
 st.session_state.student_id_input = student_id
 
-
-# ----------------------------
-# 10) 驗證學號
-# ----------------------------
 if student_id:
-    if "學號" not in data.columns:
-        st.error("❌ 試算表缺少「學號」欄位")
-        st.stop()
+    info = main_df[main_df["學號"].astype(str) == str(student_id)]
 
-    student_info = data[data["學號"].astype(str) == str(student_id)]
-    if student_info.empty:
+    if info.empty:
         st.session_state.verified_student_id = None
         st.session_state.eligible = False
         st.error(f"❌ 查無學號 {student_id}")
     else:
-        status = str(student_info.iloc[0].get("本次領取狀態", "")).strip()
-        if status == "已領取":
+        status = str(info.iloc[0].get(STATUS_COL, "")).strip()
+        if status == PICKED_TEXT:
             st.session_state.verified_student_id = None
             st.session_state.eligible = False
             st.warning(f"⚠️ 學號 {student_id} 已經領取過囉！")
         else:
+            # 庫存不足就阻擋（如果有庫存表）
+            inv_df, _ = try_load_inventory()
+            if inv_df is not None:
+                stock_col = None
+                for c in inv_df.columns:
+                    if c == "庫存" or ("庫存" in c):
+                        stock_col = c
+                        break
+                if stock_col:
+                    try:
+                        cur_stock = int(inv_df.iloc[0].get(stock_col, 0))
+                    except Exception:
+                        cur_stock = 0
+                    if cur_stock <= 0:
+                        st.error("❌ 目前庫存不足，請先補貨後再登記。")
+                        st.stop()
+
             st.session_state.verified_student_id = str(student_id)
             st.session_state.eligible = True
             st.success("✅ 符合資格！請簽名。")
 
-
 # ----------------------------
-# 11) 簽名板 + 存檔（PNG + PDF）
+# 簽名板（可切橫向/加大）
 # ----------------------------
 if st.session_state.eligible and st.session_state.verified_student_id == str(student_id) and student_id:
+    st.markdown("""
+    <style>
+    .toolbar {border:1px solid rgba(0,0,0,.08); border-radius:16px; padding:12px; background:white;}
+    .canvas-wrap {border-radius:16px; overflow:hidden; border:1px solid rgba(0,0,0,.10);}
+    .small-label {font-size:12px; color:rgba(0,0,0,.6); margin-bottom:4px;}
+    </style>
+    """, unsafe_allow_html=True)
+
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
 
-    c1, c2, c3, c4, c5 = st.columns([1.3, 1, 1, 1, 1])
+    # 工具列
+    c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1, 1, 1, 1, 1.2])
     with c1:
         st.markdown('<div class="small-label">工具</div>', unsafe_allow_html=True)
         tool = st.selectbox("tool", ["筆刷", "橡皮擦", "直線", "矩形", "圓形"], label_visibility="collapsed")
     with c2:
-        st.markdown('<div class="small-label">筆觸顏色</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-label">筆色</div>', unsafe_allow_html=True)
         stroke_color = st.color_picker("stroke", "#111111", label_visibility="collapsed")
     with c3:
-        st.markdown('<div class="small-label">背景色</div>', unsafe_allow_html=True)
-        bg_color = st.color_picker("bg", "#F1F5F9", label_visibility="collapsed")
+        st.markdown('<div class="small-label">背景</div>', unsafe_allow_html=True)
+        bg_color = st.color_picker("bg", "#FFFFFF", label_visibility="collapsed")
     with c4:
         st.markdown('<div class="small-label">粗細</div>', unsafe_allow_html=True)
-        stroke_width = st.slider("w", 1, 20, 4, label_visibility="collapsed")
+        stroke_width = st.slider("w", 1, 20, 6, label_visibility="collapsed")
     with c5:
+        st.markdown('<div class="small-label">簽名大小</div>', unsafe_allow_html=True)
+        size_mode = st.selectbox("size", ["大(推薦)", "超大"], label_visibility="collapsed")
+    with c6:
         st.markdown('<div class="small-label">清除</div>', unsafe_allow_html=True)
-        if st.button("🧹", use_container_width=True):
+        if st.button("🧹 清空簽名", use_container_width=True):
             st.session_state.canvas_nonce += 1
             st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # 大小設定：直式也給你「橫向手感」的大區域
+    if size_mode == "大(推薦)":
+        canvas_h = 420
+    else:
+        canvas_h = 520
+
+    # 工具映射
     if tool == "筆刷":
         drawing_mode = "freedraw"
         effective_stroke = stroke_color
@@ -535,13 +557,16 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
         stroke_width=stroke_width,
         stroke_color=effective_stroke,
         background_color=bg_color,
-        height=240,
+        height=canvas_h,
         drawing_mode=drawing_mode,
         update_streamlit=True,
         key=f"sig_canvas_{st.session_state.canvas_nonce}",
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ----------------------------
+    # 存檔
+    # ----------------------------
     if st.button("🚀 確認領取並存檔", use_container_width=True):
         if canvas_result.image_data is None:
             st.warning("請先簽名再點擊送出。")
@@ -549,22 +574,23 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
 
         try:
             with st.spinner("正在存檔中..."):
-                # 0) 抓最新狀態，避免快取造成重複領取
-                latest = fetch_data(SHEET_URL)
-                student_info2 = latest[latest["學號"].astype(str) == str(student_id)]
-                if student_info2.empty:
+                # 抓最新狀態避免快取
+                latest = fetch_sheet(SHEET_URL, "工作表1")
+                status_col_latest = detect_status_column(latest)
+
+                info2 = latest[latest["學號"].astype(str) == str(student_id)]
+                if info2.empty:
                     st.error("❌ 資料已更新，找不到該學號，請重新輸入。")
                     st.stop()
 
-                status2 = str(student_info2.iloc[0].get("本次領取狀態", "")).strip()
-                if status2 == "已領取":
+                status2 = str(info2.iloc[0].get(status_col_latest, "")).strip()
+                if status2 == PICKED_TEXT:
                     st.warning("⚠️ 剛剛已被登記領取（可能重複操作），請勿重複送出。")
                     st.stop()
 
-                # 1) canvas -> PNG
+                # 1) PNG
                 png_bytes = canvas_to_png_bytes(canvas_result.image_data)
 
-                # 台灣時間
                 ts = datetime.datetime.now(TZ_TAIPEI)
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
                 ts_file = ts.strftime("%Y%m%d_%H%M%S")
@@ -572,28 +598,34 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
                 png_name = f"signature_{student_id}_{ts_file}.png"
                 png_id, png_link = upload_bytes_to_drive(png_bytes, png_name, "image/png")
 
-                # 2) 產 PDF + 上傳
+                # 2) PDF
                 pdf_bytes = make_receipt_pdf(student_id, ts_str, png_bytes)
                 pdf_name = f"receipt_{student_id}_{ts_file}.pdf"
                 pdf_id, pdf_link = upload_bytes_to_drive(pdf_bytes, pdf_name, "application/pdf")
 
-                # 3) 寫入 Sheet
-                gc = get_gsheet_client()
-                doc = gc.open_by_url(SHEET_URL)
-                sheet_main = doc.worksheet("工作表1")
-                sheet_log = doc.worksheet("領取日誌")
+                # 3) 寫回 Sheet
+                ws_main = get_worksheet(SHEET_URL, "工作表1")
+                ws_log = get_worksheet(SHEET_URL, "領取日誌")
 
-                row_idx = int(student_info2.index[0]) + 2
-                sheet_main.update_cell(row_idx, 2, "已領取")
+                row_idx = int(info2.index[0]) + 2  # df index -> sheet row
+                # 狀態欄位位置（用最新 df 的欄位）
+                status_col_index = list(latest.columns).index(status_col_latest) + 1
+                ws_main.update_cell(row_idx, status_col_index, PICKED_TEXT)
 
-                sheet_log.append_row([str(student_id), ts_str, png_id, png_link, pdf_id, pdf_link])
+                ws_log.append_row([str(student_id), ts_str, png_id, png_link, pdf_id, pdf_link])
+
+                # 4) 扣庫存（若有庫存表）
+                inv_df, _ = try_load_inventory()
+                if inv_df is not None:
+                    ok, msg = try_update_inventory(delta=-1)
+                    if not ok:
+                        st.warning(f"⚠️ 已完成登記，但庫存扣帳失敗：{msg}")
 
             st.cache_data.clear()
             st.session_state.verified_student_id = None
             st.session_state.eligible = False
             st.session_state.canvas_nonce += 1
             st.session_state.student_id_input = ""
-            st.session_state.scan_debug = ""
 
             st.success(f"🎉 登記成功！學號 {student_id} 已完成領取。")
             st.info("✅ 已上傳簽名 PNG 與簽收 PDF 到 Google Drive，並寫入日誌連結。")
