@@ -79,15 +79,15 @@ def make_receipt_pdf(student_id: str, ts_str: str, signature_png_bytes: bytes) -
     c = pdf_canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, height - 60, "Sanitary Product Pickup Receipt")
+    c.setFont("Noto Sans Traditional Chinese-Black 900", 16)
+    c.drawString(40, height - 60, "生理用品簽收單")
 
-    c.setFont("Helvetica", 12)
-    c.drawString(40, height - 95, f"Student ID: {student_id}")
-    c.drawString(40, height - 115, f"Timestamp: {ts_str}")
+    c.setFont("Noto Sans Traditional Chinese-Black 900", 12)
+    c.drawString(40, height - 95, f"學號: {student_id}")
+    c.drawString(40, height - 115, f"領取時間: {ts_str}")
 
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, height - 155, "Signature:")
+    c.setFont("Noto Sans Traditional Chinese-Black 900", 12)
+    c.drawString(40, height - 155, "簽名:")
 
     sig_img = ImageReader(io.BytesIO(signature_png_bytes))
     img_w = 420
