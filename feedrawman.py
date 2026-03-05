@@ -8,26 +8,41 @@ from googleapiclient.http import MediaIoBaseUpload
 from streamlit_drawable_canvas import st_canvas
 import datetime
 import io
+import re
 from PIL import Image
+
+# 台灣時間
+from zoneinfo import ZoneInfo
+
+# 寄信
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+
 
 # ----------------------------
-# 1) 基本設定
+# 0) 常數
 # ----------------------------
+TZ_TAIPEI = ZoneInfo("Asia/Taipei")
+
 st.set_page_config(page_title="衛生組生理用品發放系統", layout="centered")
 st.title("🌸 校園生理用品領取系統")
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/13bMCf_cgdfByYH_DgUZynKHKZAHd2qmXJKyeCfCQOg8/edit"
-DRIVE_FOLDER_ID = "1WPfK0coynKAwb15EfVp0st5VEGjNmUAl"  # ✅ 你新的資料夾
+DRIVE_FOLDER_ID = "1WPfK0coynKAwb15EfVp0st5VEGjNmUAl"
+
+# 你校內學號長度（請依你學校調整）
+STUDENT_ID_MIN_LEN = 6
+STUDENT_ID_MAX_LEN = 10
+
 
 # ----------------------------
-# 2) Google API
+# 1) Google API
 # ----------------------------
 @st.cache_resource
 def get_gcp_credentials():
@@ -50,8 +65,9 @@ def fetch_data(url):
     sheet = doc.worksheet("工作表1")
     return pd.DataFrame(sheet.get_all_records())
 
+
 # ----------------------------
-# 3) 工具：簽名、上傳、PDF
+# 2) 工具：簽名、上傳、PDF
 # ----------------------------
 def canvas_to_png_bytes(canvas_image_data) -> bytes:
     img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
@@ -75,57 +91,59 @@ def upload_bytes_to_drive(file_bytes: bytes, filename: str, mimetype: str) -> tu
 
 @st.cache_resource
 def register_pdf_fonts():
-    # 你 repo 裡的字體檔路徑
-    pdfmetrics.registerFont(TTFont("NotoSansTC-Black", "fonts/NotoSansTC-Black.ttf"))
+    # 你已經成功的版本：若你已放字體檔，這行就會生效
+    # 沒放字體檔也沒關係：下面 make_receipt_pdf 會 fallback
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        pdfmetrics.registerFont(TTFont("NotoSansTC-Black", "fonts/NotoSansTC-Black.ttf"))
+        return True
+    except Exception:
+        return False
 
 def make_receipt_pdf(student_id: str, ts_str: str, signature_png_bytes: bytes) -> bytes:
     """
-    產出中文 PDF 簽收單（使用 NotoSansTC Black）
+    中文簽收單（優先使用 NotoSansTC-Black；失敗則 fallback Helvetica）
     """
-    register_pdf_fonts()
+    ok_font = register_pdf_fonts()
+    font_name = "NotoSansTC-Black" if ok_font else "Helvetica-Bold"
 
     buf = io.BytesIO()
     c = pdf_canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
     # 標題
-    c.setFont("NotoSansTC-Black", 18)
+    c.setFont(font_name, 18)
     c.drawString(40, height - 60, "生理用品領取簽收單")
 
     # 基本資訊
-    c.setFont("NotoSansTC-Black", 12)
+    c.setFont(font_name, 12)
     c.drawString(40, height - 98, f"學號：{student_id}")
     c.drawString(40, height - 120, f"時間：{ts_str}")
 
     # 簽名區
-    c.setFont("NotoSansTC-Black", 12)
+    c.setFont(font_name, 12)
     c.drawString(40, height - 160, "簽名：")
 
     sig_img = ImageReader(io.BytesIO(signature_png_bytes))
-
-    # 簽名框位置/大小（你可調整）
     img_w = 420
     img_h = 160
     x = 40
     y = height - 160 - img_h - 10
 
-    # 畫簽名框
     c.rect(x, y, img_w, img_h, stroke=1, fill=0)
-
-    # 放簽名圖（PNG 透明背景也 OK）
     c.drawImage(sig_img, x, y, width=img_w, height=img_h, mask="auto")
 
-    # 底部註記
-    c.setFont("NotoSansTC-Black", 10)
+    c.setFont(font_name, 10)
     c.drawString(40, 40, "本簽收單由系統自動產生")
 
     c.showPage()
     c.save()
     return buf.getvalue()
 
+
 # ----------------------------
-# 4) 手機相機掃一維條碼（QuaggaJS）
-#    掃到後：把結果寫進 URL ?sid=xxxx，觸發整頁 rerun
+# 3) 掃碼：QuaggaJS（掃到後寫入 URL ?sid=xxxx）
 # ----------------------------
 def barcode_scanner_quagga(height: int = 420):
     html = """
@@ -135,7 +153,7 @@ def barcode_scanner_quagga(height: int = 420):
 
       <div class="p-3 space-y-3">
         <div class="flex items-center justify-between">
-          <div class="text-sm text-slate-600">對準條碼，亮一點、距離 10–18cm。掃到會自動停止並回填學號。</div>
+          <div class="text-sm text-slate-600">對準條碼（亮一點、距離 10–18cm）。掃到會自動回填。</div>
           <div class="text-xs text-slate-500" id="status">未啟動</div>
         </div>
 
@@ -147,10 +165,6 @@ def barcode_scanner_quagga(height: int = 420):
           <button id="stopBtn"
             class="px-3 py-2 rounded-xl bg-slate-200 text-slate-900 text-sm active:scale-[0.99]">
             停止
-          </button>
-          <button id="torchBtn"
-            class="px-3 py-2 rounded-xl bg-slate-200 text-slate-900 text-sm active:scale-[0.99]">
-            手電筒
           </button>
         </div>
 
@@ -170,36 +184,19 @@ def barcode_scanner_quagga(height: int = 420):
       const resultEl = document.getElementById("result");
       const startBtn = document.getElementById("startBtn");
       const stopBtn = document.getElementById("stopBtn");
-      const torchBtn = document.getElementById("torchBtn");
 
       let lastCode = "";
       let scanning = false;
-      let track = null;
-      let torchOn = false;
 
       function setStatus(t) { statusEl.textContent = t; }
 
       function sendToStreamlit(value) {
-        // ✅ 將掃描結果寫入父頁 URL query param：?sid=xxxx
+        // 將掃描結果寫入父頁 URL query param：?sid=xxxx
         const url = new URL(window.parent.location.href);
         url.searchParams.set("sid", value);
+        // 加一個 cache-bust，避免某些瀏覽器不重載
+        url.searchParams.set("_t", Date.now().toString());
         window.parent.location.href = url.toString();
-      }
-
-      async function tryEnableTorch() {
-        try {
-          if (!track) return;
-          const caps = track.getCapabilities ? track.getCapabilities() : null;
-          if (!caps || !caps.torch) {
-            alert("此裝置/瀏覽器不支援手電筒");
-            return;
-          }
-          torchOn = !torchOn;
-          await track.applyConstraints({ advanced: [{ torch: torchOn }] });
-        } catch (e) {
-          console.log(e);
-          alert("手電筒啟用失敗（可能不支援）");
-        }
       }
 
       function start() {
@@ -238,14 +235,6 @@ def barcode_scanner_quagga(height: int = 420):
           Quagga.start();
           scanning = true;
           setStatus("掃描中");
-
-          setTimeout(() => {
-            const video = document.querySelector("#scanner video");
-            if (video && video.srcObject) {
-              const tracks = video.srcObject.getVideoTracks();
-              if (tracks && tracks.length) track = tracks[0];
-            }
-          }, 800);
         });
 
         Quagga.onDetected(function(data) {
@@ -269,13 +258,79 @@ def barcode_scanner_quagga(height: int = 420):
 
       startBtn.addEventListener("click", start);
       stopBtn.addEventListener("click", stop);
-      torchBtn.addEventListener("click", tryEnableTorch);
     </script>
     """
     return components.html(html, height=height)
 
+
 # ----------------------------
-# 5) 讀取名單
+# 4) 把掃描字串轉成「學號」
+# ----------------------------
+def parse_student_id(raw: str) -> tuple[str | None, str]:
+    """
+    回傳 (student_id_or_none, debug_message)
+    規則：抓最像學號的一段連續數字（長度 6~10 可調）
+    """
+    if raw is None:
+        return None, "raw=None"
+
+    s = str(raw).strip()
+    # 有些情況 query_params 可能給 list
+    if isinstance(raw, list) and raw:
+        s = str(raw[0]).strip()
+
+    # 抓出所有連續數字片段
+    nums = re.findall(r"\d+", s)
+    if not nums:
+        return None, f"raw='{s}' 找不到任何數字片段"
+
+    # 優先選「長度符合學號範圍」的片段，且取最長/最像的
+    candidates = [x for x in nums if STUDENT_ID_MIN_LEN <= len(x) <= STUDENT_ID_MAX_LEN]
+    if candidates:
+        # 取最長的（通常學號固定長度）
+        candidates.sort(key=len, reverse=True)
+        return candidates[0], f"raw='{s}' nums={nums} -> pick={candidates[0]}"
+
+    # 若沒有符合長度的，就退而求其次：取最長一段
+    nums.sort(key=len, reverse=True)
+    return nums[0], f"raw='{s}' nums={nums} -> fallback_pick={nums[0]}"
+
+
+# ----------------------------
+# 5) SMTP 寄信
+# ----------------------------
+def send_email(to_addr: str, subject: str, body: str) -> None:
+    """
+    從 st.secrets 讀 SMTP 設定：
+    st.secrets["smtp"]["host"], ["port"], ["username"], ["password"], ["from_name"], ["from_addr"], ["use_tls"]
+    """
+    cfg = st.secrets["smtp"]
+    host = cfg["host"]
+    port = int(cfg.get("port", 587))
+    username = cfg.get("username", "")
+    password = cfg.get("password", "")
+    from_addr = cfg.get("from_addr", username)
+    from_name = cfg.get("from_name", "衛生組")
+    use_tls = bool(cfg.get("use_tls", True))
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{from_name} <{from_addr}>"
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    with smtplib.SMTP(host, port, timeout=20) as server:
+        server.ehlo()
+        if use_tls:
+            server.starttls()
+            server.ehlo()
+        if username and password:
+            server.login(username, password)
+        server.send_message(msg)
+
+
+# ----------------------------
+# 6) 讀取名單
 # ----------------------------
 try:
     data = fetch_data(SHEET_URL)
@@ -283,8 +338,9 @@ except Exception as e:
     st.error(f"❌ 資料讀取失敗：{e}")
     st.stop()
 
+
 # ----------------------------
-# 6) UI 美化 + 狀態
+# 7) UI 美化 + session_state
 # ----------------------------
 st.markdown("""
 <style>
@@ -303,40 +359,100 @@ if "canvas_nonce" not in st.session_state:
     st.session_state.canvas_nonce = 0
 if "student_id_input" not in st.session_state:
     st.session_state.student_id_input = ""
+if "scan_debug" not in st.session_state:
+    st.session_state.scan_debug = ""
 
+
+# ----------------------------
+# 8) 管理功能：寄提醒信（在 sidebar）
+# ----------------------------
+with st.sidebar:
+    st.header("✉️ 提醒信寄送")
+
+    # 你可以自行加管理密碼（避免學生亂寄）
+    admin_ok = True
+    if "admin" in st.secrets:
+        pwd = st.text_input("管理密碼", type="password")
+        admin_ok = (pwd == st.secrets["admin"].get("password", ""))
+
+    if not admin_ok:
+        st.warning("需要管理密碼才能寄信")
+    else:
+        st.caption("收件人規則：學號 + @g.clvs.tyc.edu.tw")
+
+        # 你可以貼一個或多個學號（每行一個）
+        ids_text = st.text_area(
+            "要寄信的學號（可多筆，每行一個）",
+            placeholder="例如：\n311117\n311118",
+            height=120,
+        )
+
+        subject = st.text_input("主旨", value="生理用品領取提醒")
+        body = st.text_area(
+            "內容（可用 {student_id} 代入學號）",
+            value="同學您好：\n\n提醒您可至衛生組領取生理用品。\n學號：{student_id}\n\n謝謝。",
+            height=180,
+        )
+
+        if st.button("📨 寄出提醒信", use_container_width=True):
+            ids = [x.strip() for x in ids_text.splitlines() if x.strip()]
+            if not ids:
+                st.error("請至少輸入 1 個學號")
+            else:
+                failed = []
+                sent = 0
+                for sid in ids:
+                    email = f"{sid}@g.clvs.tyc.edu.tw"
+                    try:
+                        send_email(
+                            to_addr=email,
+                            subject=subject.format(student_id=sid),
+                            body=body.format(student_id=sid),
+                        )
+                        sent += 1
+                    except Exception as e:
+                        failed.append((sid, str(e)))
+
+                if sent:
+                    st.success(f"已寄出 {sent} 封")
+                if failed:
+                    st.error("部分寄送失敗：")
+                    for sid, err in failed[:10]:
+                        st.write(f"- {sid}: {err}")
+
+
+# ----------------------------
+# 9) 領取登記 + 掃描
+# ----------------------------
 st.write("---")
 st.subheader("🔍 領取登記")
 
-# ----------------------------
-# 7) 從 URL 讀 sid 自動回填（掃描成功會帶 ?sid=xxxx）
-# ----------------------------
+# 讀 URL query params：sid（掃描結果）
 try:
-    sid = st.query_params.get("sid", None)
+    raw_sid = st.query_params.get("sid", None)
 except Exception:
-    sid = None
+    raw_sid = None
 
-if sid:
-    # 有些版本會是 list
-    if isinstance(sid, list) and sid:
-        sid = sid[0]
-    sid = str(sid).strip()
-    sid_digits = "".join(ch for ch in sid if ch.isdigit())
-    if sid_digits:
-        st.session_state.student_id_input = sid_digits
-    # 清掉 query params，避免重整又重覆套用
+if raw_sid:
+    student_id_parsed, dbg = parse_student_id(raw_sid)
+    st.session_state.scan_debug = dbg
+    if student_id_parsed:
+        st.session_state.student_id_input = student_id_parsed
+    # 清 query params（避免一直重覆套用）
     try:
         st.query_params.clear()
     except Exception:
         pass
 
-# ----------------------------
-# 8) 掃描 UI
-# ----------------------------
-st.markdown('<div class="hint">學生證是「一維條碼」。開啟掃描後，允許相機權限，對準條碼即可（掃到會自動回填學號）。</div>', unsafe_allow_html=True)
+st.markdown('<div class="hint">若掃描回填失敗，下面會顯示掃描 debug（只給你看）。</div>', unsafe_allow_html=True)
 enable_scan = st.toggle("📷 用手機相機掃學生證條碼", value=False)
-
 if enable_scan:
     barcode_scanner_quagga()
+
+# 顯示 debug（你要更乾淨可關掉）
+if st.session_state.scan_debug:
+    with st.expander("🛠️ 掃描 debug（若回填不對請看這裡）"):
+        st.code(st.session_state.scan_debug)
 
 student_id = st.text_input(
     "👉 請輸入或掃描學生證學號：",
@@ -344,8 +460,9 @@ student_id = st.text_input(
 ).strip()
 st.session_state.student_id_input = student_id
 
+
 # ----------------------------
-# 9) 驗證學號
+# 10) 驗證學號
 # ----------------------------
 if student_id:
     if "學號" not in data.columns:
@@ -368,8 +485,9 @@ if student_id:
             st.session_state.eligible = True
             st.success("✅ 符合資格！請簽名。")
 
+
 # ----------------------------
-# 10) 簽名板 + 存檔（PNG + PDF）
+# 11) 簽名板 + 存檔（PNG + PDF）
 # ----------------------------
 if st.session_state.eligible and st.session_state.verified_student_id == str(student_id) and student_id:
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
@@ -445,7 +563,9 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
 
                 # 1) canvas -> PNG
                 png_bytes = canvas_to_png_bytes(canvas_result.image_data)
-                ts = datetime.datetime.now()
+
+                # 台灣時間
+                ts = datetime.datetime.now(TZ_TAIPEI)
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
                 ts_file = ts.strftime("%Y%m%d_%H%M%S")
 
@@ -466,7 +586,6 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
                 row_idx = int(student_info2.index[0]) + 2
                 sheet_main.update_cell(row_idx, 2, "已領取")
 
-                # 日誌：學號 / 時間 / png_id / png_link / pdf_id / pdf_link
                 sheet_log.append_row([str(student_id), ts_str, png_id, png_link, pdf_id, pdf_link])
 
             st.cache_data.clear()
@@ -474,6 +593,7 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
             st.session_state.eligible = False
             st.session_state.canvas_nonce += 1
             st.session_state.student_id_input = ""
+            st.session_state.scan_debug = ""
 
             st.success(f"🎉 登記成功！學號 {student_id} 已完成領取。")
             st.info("✅ 已上傳簽名 PNG 與簽收 PDF 到 Google Drive，並寫入日誌連結。")
