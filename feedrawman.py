@@ -30,7 +30,7 @@ from reportlab.lib.utils import ImageReader
 # ----------------------------
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
-st.set_page_config(page_title="衛生組生理用品發放系統", layout="centered")
+st.set_page_config(page_title="衛生組生理用品領取系統", layout="centered")
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/13bMCf_cgdfByYH_DgUZynKHKZAHd2qmXJKyeCfCQOg8/edit"
 DRIVE_FOLDER_ID = "1WPfK0coynKAwb15EfVp0st5VEGjNmUAl"
@@ -41,27 +41,51 @@ WATERMARK_TEXT = "衛生組專用"
 
 
 # ----------------------------
-# 全站密碼保護
+# 安全：雙密碼 + 錯誤鎖定
 # ----------------------------
 def check_app_password():
     if "app_unlocked" not in st.session_state:
         st.session_state.app_unlocked = False
+    if "login_fail_count" not in st.session_state:
+        st.session_state.login_fail_count = 0
+    if "login_locked_until" not in st.session_state:
+        st.session_state.login_locked_until = None
 
     if st.session_state.app_unlocked:
         return
 
+    passwords = st.secrets["app"]["passwords"]
+    max_attempts = int(st.secrets["app"].get("max_attempts", 5))
+    lock_seconds = int(st.secrets["app"].get("lock_seconds", 30))
+
     st.title("🔒 衛生組生理用品領取系統")
     st.warning("請先輸入網站密碼")
+
+    now = datetime.datetime.now(TZ_TAIPEI)
+    locked_until = st.session_state.login_locked_until
+
+    if locked_until and now < locked_until:
+        remaining = int((locked_until - now).total_seconds())
+        st.error(f"登入失敗次數過多，請 {remaining} 秒後再試")
+        st.stop()
 
     pwd = st.text_input("網站密碼", type="password")
 
     if st.button("登入", use_container_width=True):
-        correct_pwd = st.secrets["app"]["password"]
-        if pwd == correct_pwd:
+        if pwd in passwords:
             st.session_state.app_unlocked = True
+            st.session_state.login_fail_count = 0
+            st.session_state.login_locked_until = None
             st.rerun()
         else:
-            st.error("密碼錯誤")
+            st.session_state.login_fail_count += 1
+            remain_attempts = max_attempts - st.session_state.login_fail_count
+
+            if st.session_state.login_fail_count >= max_attempts:
+                st.session_state.login_locked_until = now + datetime.timedelta(seconds=lock_seconds)
+                st.error(f"密碼錯誤次數過多，已鎖定 {lock_seconds} 秒")
+            else:
+                st.error(f"密碼錯誤，剩餘 {remain_attempts} 次嘗試")
 
     st.stop()
 
@@ -120,7 +144,7 @@ def detect_status_column(df: pd.DataFrame) -> str:
 
 
 # ----------------------------
-# 字體 / 浮水印
+# 字體
 # ----------------------------
 def get_font_for_image(img_width: int):
     size = max(18, int(img_width * 0.06))
@@ -134,17 +158,12 @@ def get_font_for_image(img_width: int):
 
 
 # ----------------------------
-# 簽名圖處理
+# 簽名圖：強制旋轉 + 浮水印
 # ----------------------------
 def canvas_to_png_bytes(canvas_image_data) -> bytes:
-    """
-    1) canvas -> PNG
-    2) 強制旋轉 90 度（學生橫拿手機簽名 -> 存成直的）
-    3) 加浮水印：衛生組專用
-    """
     img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
 
-    # 每次都強制旋轉
+    # 學生固定橫著簽，強制轉正
     img = img.rotate(90, expand=True)
 
     w, h = img.size
@@ -167,64 +186,37 @@ def canvas_to_png_bytes(canvas_image_data) -> bytes:
 
 
 # ----------------------------
-# Drive 上傳 + 鎖權限
+# Drive：上傳 + 去公開
 # ----------------------------
-def lock_down_drive_file(file_id: str):
+def remove_public_permissions(file_id: str):
     """
-    將檔案權限鎖緊：
-    1) 移除 anyone 權限
-    2) 若 secrets 有設定 security.drive_domain，則改成該網域可讀
-       若沒有設定，則不另外建立公開讀取權限（只保留既有受控權限）
+    移除 anyone 公開權限。
+    注意：若 Shared Drive/父資料夾本身有更寬的繼承權限，這裡無法完全推翻繼承。
     """
     drive = get_gdrive_service()
 
-    # 先列出目前權限
-    perms = drive.permissions().list(
-        fileId=file_id,
-        supportsAllDrives=True,
-        fields="permissions(id,type,role,domain,emailAddress)"
-    ).execute()
+    try:
+        perms = drive.permissions().list(
+            fileId=file_id,
+            supportsAllDrives=True,
+            fields="permissions(id,type,role)"
+        ).execute()
 
-    permissions = perms.get("permissions", [])
+        permissions = perms.get("permissions", [])
+        for p in permissions:
+            if p.get("type") == "anyone":
+                try:
+                    drive.permissions().delete(
+                        fileId=file_id,
+                        permissionId=p["id"],
+                        supportsAllDrives=True
+                    ).execute()
+                except Exception:
+                    pass
+    except Exception:
+        # 權限清理失敗不致命，但不宣稱一定完全成功
+        pass
 
-    # 移除 anyone 權限
-    for p in permissions:
-        if p.get("type") == "anyone":
-            try:
-                drive.permissions().delete(
-                    fileId=file_id,
-                    permissionId=p["id"],
-                    supportsAllDrives=True
-                ).execute()
-            except Exception:
-                pass
-
-    # 可選：限制成網域內可讀
-    drive_domain = ""
-    if "security" in st.secrets:
-        drive_domain = st.secrets["security"].get("drive_domain", "").strip()
-
-    if drive_domain:
-        # 先看看有沒有 domain permission，避免重複新增
-        has_domain_perm = any(
-            p.get("type") == "domain" and p.get("domain") == drive_domain
-            for p in permissions
-        )
-        if not has_domain_perm:
-            try:
-                drive.permissions().create(
-                    fileId=file_id,
-                    supportsAllDrives=True,
-                    sendNotificationEmail=False,
-                    body={
-                        "type": "domain",
-                        "role": "reader",
-                        "domain": drive_domain
-                    }
-                ).execute()
-            except Exception:
-                # Shared Drive 的既有設定有時已足夠，不必因這裡失敗就整體失敗
-                pass
 
 def upload_bytes_to_drive(file_bytes: bytes, filename: str, mimetype: str) -> tuple[str, str]:
     drive = get_gdrive_service()
@@ -234,17 +226,17 @@ def upload_bytes_to_drive(file_bytes: bytes, filename: str, mimetype: str) -> tu
     created = drive.files().create(
         body=metadata,
         media_body=media,
-        fields="id,webViewLink",
+        fields="id",
         supportsAllDrives=True
     ).execute()
 
     file_id = created["id"]
-    web_link = created.get("webViewLink", "")
 
-    # ✅ 上傳完立刻鎖權限
-    lock_down_drive_file(file_id)
+    # 去掉任何 public 權限
+    remove_public_permissions(file_id)
 
-    return file_id, web_link
+    # ✅ 不回傳 webViewLink，避免連結外流
+    return file_id, ""
 
 
 # ----------------------------
@@ -555,6 +547,11 @@ student_id = st.text_input("👉 請輸入學生證學號：", value=st.session_
 st.session_state.student_id_input = student_id
 
 if student_id:
+    # 基本輸入限制（不是 IP 防爆破，但可減少亂打）
+    if not student_id.isdigit() or not (4 <= len(student_id) <= 12):
+        st.error("❌ 學號格式不正確")
+        st.stop()
+
     info = main_df[main_df["學號"].astype(str) == str(student_id)]
 
     if info.empty:
@@ -645,7 +642,7 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
                     st.warning("⚠️ 剛剛已被登記領取（可能重複操作），請勿重複送出。")
                     st.stop()
 
-                # 1) 產生處理後簽名 PNG
+                # ✅ 簽名圖：轉正 + 浮水印
                 png_bytes = canvas_to_png_bytes(canvas_result.image_data)
 
                 ts = datetime.datetime.now(TZ_TAIPEI)
@@ -653,17 +650,16 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
                 ts_file = ts.strftime("%Y%m%d_%H%M%S")
 
                 # ✅ UUID 檔名，不暴露學號
-                sign_uuid = str(uuid.uuid4())
+                png_uuid = str(uuid.uuid4())
                 pdf_uuid = str(uuid.uuid4())
 
-                png_name = f"signature_{sign_uuid}_{ts_file}.png"
-                png_id, png_link = upload_bytes_to_drive(png_bytes, png_name, "image/png")
+                png_name = f"signature_{png_uuid}_{ts_file}.png"
+                png_id, _ = upload_bytes_to_drive(png_bytes, png_name, "image/png")
 
                 pdf_bytes = make_receipt_pdf(student_id, ts_str, png_bytes)
                 pdf_name = f"receipt_{pdf_uuid}_{ts_file}.pdf"
-                pdf_id, pdf_link = upload_bytes_to_drive(pdf_bytes, pdf_name, "application/pdf")
+                pdf_id, _ = upload_bytes_to_drive(pdf_bytes, pdf_name, "application/pdf")
 
-                # 2) 寫回試算表
                 ws_main = get_worksheet(SHEET_URL, "工作表1")
                 ws_log = get_worksheet(SHEET_URL, "領取日誌")
 
@@ -671,10 +667,9 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
                 status_col_index = list(latest.columns).index(status_col_latest) + 1
                 ws_main.update_cell(row_idx, status_col_index, PICKED_TEXT)
 
-                # 保留學號在 sheet，但 Drive 檔名不含學號
-                ws_log.append_row([str(student_id), ts_str, png_id, png_link, pdf_id, pdf_link])
+                # ✅ 只存 file_id，不存 webViewLink
+                ws_log.append_row([str(student_id), ts_str, png_id, pdf_id])
 
-                # 3) 扣庫存
                 inv_df3 = try_load_inventory()
                 if inv_df3 is not None:
                     ok, msg = try_update_inventory(delta=-1)
@@ -688,7 +683,7 @@ if st.session_state.eligible and st.session_state.verified_student_id == str(stu
             st.session_state.student_id_input = ""
 
             st.success(f"🎉 登記成功！學號 {student_id} 已完成領取。")
-            st.info("✅ 檔案已以 UUID 命名、上傳後自動鎖權限，並寫入日誌。")
+            st.info("✅ 簽名圖已加浮水印、檔名已 UUID 化、Drive 已去除公開權限。")
 
             time.sleep(0.6)
             st.rerun()
