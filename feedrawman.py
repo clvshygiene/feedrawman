@@ -12,7 +12,7 @@ import os
 import time
 import uuid
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageChops
 
 # Email
 import smtplib
@@ -161,18 +161,56 @@ def get_font_for_image(img_width: int):
 # 簽名圖：強制旋轉 + 浮水印
 # ----------------------------
 def canvas_to_png_bytes(canvas_image_data) -> bytes:
+    """
+    1) canvas -> PNG
+    2) 強制旋轉 90 度（學生橫拿手機簽名 -> 存成直的）
+    3) 自動裁掉多餘空白
+    4) 加浮水印：衛生組專用
+    """
     img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
 
-    # 學生固定橫著簽，強制轉正
+    # 強制旋轉
     img = img.rotate(90, expand=True)
 
+    # --- 自動裁切空白 ---
+    # 以「非接近白色」區域當成簽名範圍
+    rgb = img.convert("RGB")
+    bg = Image.new("RGB", rgb.size, (255, 255, 255))
+
+    # 找出和白底不同的 bbox
+    diff = Image.eval(
+        Image.merge("RGB", [
+            ImageChops.difference(rgb, bg).getchannel(0),
+            ImageChops.difference(rgb, bg).getchannel(1),
+            ImageChops.difference(rgb, bg).getchannel(2),
+        ]),
+        lambda x: 255 if x > 20 else 0  # 門檻值，可微調
+    )
+
+    bbox = diff.getbbox()
+
+    if bbox:
+        # 加一點 padding，避免簽名貼邊
+        left, top, right, bottom = bbox
+        pad_x = 30
+        pad_y = 30
+
+        left = max(0, left - pad_x)
+        top = max(0, top - pad_y)
+        right = min(img.width, right + pad_x)
+        bottom = min(img.height, bottom + pad_y)
+
+        img = img.crop((left, top, right, bottom))
+
     w, h = img.size
+
+    # --- 加浮水印 ---
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     font = get_font_for_image(w)
-    bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
-    tw = bbox[2] - bbox[0]
+    bbox_text = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
+    tw = bbox_text[2] - bbox_text[0]
 
     x = (w - tw) // 2
     y = max(8, int(h * 0.03))
@@ -183,7 +221,6 @@ def canvas_to_png_bytes(canvas_image_data) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-
 
 # ----------------------------
 # Drive：上傳 + 去公開
