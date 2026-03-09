@@ -164,64 +164,65 @@ def canvas_to_png_bytes(canvas_image_data) -> bytes:
     """
     1) canvas -> PNG
     2) 強制旋轉 90 度（學生橫拿手機簽名 -> 存成直的）
-    3) 自動裁掉多餘空白
-    4) 加浮水印：衛生組專用
+    3) 精準裁掉多餘空白
+    4) 上方加浮水印：衛生組專用
     """
     img = Image.fromarray(canvas_image_data.astype("uint8"), mode="RGBA")
 
     # 強制旋轉
     img = img.rotate(90, expand=True)
 
-    # --- 自動裁切空白 ---
-    # 以「非接近白色」區域當成簽名範圍
+    # 轉 RGB 來找非白色區域
     rgb = img.convert("RGB")
     bg = Image.new("RGB", rgb.size, (255, 255, 255))
+    diff = ImageChops.difference(rgb, bg)
 
-    # 找出和白底不同的 bbox
-    diff = Image.eval(
-        Image.merge("RGB", [
-            ImageChops.difference(rgb, bg).getchannel(0),
-            ImageChops.difference(rgb, bg).getchannel(1),
-            ImageChops.difference(rgb, bg).getchannel(2),
-        ]),
-        lambda x: 255 if x > 20 else 0  # 門檻值，可微調
-    )
+    # 轉灰階後做 threshold，抓真正有筆跡的範圍
+    gray = diff.convert("L")
+    mask = gray.point(lambda x: 255 if x > 25 else 0)
 
-    bbox = diff.getbbox()
+    bbox = mask.getbbox()
 
     if bbox:
-        # 加一點 padding，避免簽名貼邊
         left, top, right, bottom = bbox
-        pad_x = 30
-        pad_y = 30
 
-        left = max(0, left - pad_x)
-        top = max(0, top - pad_y)
-        right = min(img.width, right + pad_x)
-        bottom = min(img.height, bottom + pad_y)
+        # 只保留少量邊界，不要大白邊
+        pad_left = 20
+        pad_right = 20
+        pad_bottom = 20
+
+        left = max(0, left - pad_left)
+        right = min(img.width, right + pad_right)
+        bottom = min(img.height, bottom + pad_bottom)
+
+        # 上方另外保留一點空間給浮水印
+        watermark_top_space = 55
+        top = max(0, top - watermark_top_space)
 
         img = img.crop((left, top, right, bottom))
 
     w, h = img.size
 
-    # --- 加浮水印 ---
+    # 加浮水印
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     font = get_font_for_image(w)
-    bbox_text = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
+    text = WATERMARK_TEXT
+
+    bbox_text = draw.textbbox((0, 0), text, font=font)
     tw = bbox_text[2] - bbox_text[0]
 
     x = (w - tw) // 2
-    y = max(8, int(h * 0.03))
+    y = 8
 
-    draw.text((x, y), WATERMARK_TEXT, font=font, fill=(0, 0, 0, 80))
+    draw.text((x, y), text, font=font, fill=(0, 0, 0, 80))
     img = Image.alpha_composite(img, overlay)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-
+    
 # ----------------------------
 # Drive：上傳 + 去公開
 # ----------------------------
@@ -309,13 +310,31 @@ def make_receipt_pdf(student_id: str, ts_str: str, signature_png_bytes: bytes) -
     c.drawString(40, height - 160, "簽名（含浮水印）：")
 
     sig_img = ImageReader(io.BytesIO(signature_png_bytes))
-    img_w = 420
-    img_h = 190
-    x = 40
-    y = height - 160 - img_h - 10
 
-    c.rect(x, y, img_w, img_h, stroke=1, fill=0)
-    c.drawImage(sig_img, x, y, width=img_w, height=img_h, mask="auto")
+    # 讀原圖尺寸
+    pil_img = Image.open(io.BytesIO(signature_png_bytes))
+    orig_w, orig_h = pil_img.size
+
+    # PDF 裡可用的最大框
+    box_w = 420
+    box_h = 190
+    box_x = 40
+    box_y = height - 160 - box_h - 10
+
+    # 等比例縮放
+    ratio = min(box_w / orig_w, box_h / orig_h)
+    draw_w = orig_w * ratio
+    draw_h = orig_h * ratio
+
+    # 置中放進框內
+    draw_x = box_x + (box_w - draw_w) / 2
+    draw_y = box_y + (box_h - draw_h) / 2
+
+    # 畫外框
+    c.rect(box_x, box_y, box_w, box_h, stroke=1, fill=0)
+
+    # 等比例放入，不硬壓縮
+    c.drawImage(sig_img, draw_x, draw_y, width=draw_w, height=draw_h, mask="auto")
 
     c.setFont(text_font, 10)
     c.drawString(40, 40, "本簽收單由系統自動產生")
